@@ -195,6 +195,18 @@ def init_db():
         is_active BOOLEAN DEFAULT TRUE,
         CONSTRAINT unique_campaign_recipient UNIQUE (campaign_id, recipient_id)
     )
+                
+    ''')
+    # Create campaign_groups table - this stores the relationship between campaigns and groups
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS campaign_groups (
+        campaign_group_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        campaign_id UUID NOT NULL REFERENCES email_campaigns(campaign_id),
+        group_id UUID NOT NULL REFERENCES groups(group_id),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        is_active BOOLEAN DEFAULT TRUE,
+        CONSTRAINT unique_campaign_group UNIQUE (campaign_id, group_id)
+    )
     ''')
     
     # Create email_tracking table
@@ -240,6 +252,7 @@ def init_db():
         FROM information_schema.columns 
         WHERE table_name='recipients' AND column_name='group_id'
     """)
+    
     
     if not cur.fetchone():
         app.logger.info("Adding group_id column to recipients table...")
@@ -483,14 +496,38 @@ def send_email_async(campaign_id, test_mode=False, base_url=None):
                 recipients = [{'email': user['email'], 'recipient_id': None}]
                 app.logger.info(f"📧 Test mode: Sending to campaign owner {user['email']}")
             else:
-                # Get all recipients for this campaign
+                # Get all direct recipients for this campaign
                 cur.execute("""
                     SELECT r.* FROM recipients r
                     JOIN campaign_recipients cr ON r.recipient_id = cr.recipient_id
                     WHERE cr.campaign_id = %s AND cr.is_active = TRUE AND r.is_active = TRUE
                 """, (campaign_id,))
-                recipients = cur.fetchall()
-                app.logger.info(f"📧 Sending campaign to {len(recipients)} recipients")
+                direct_recipients = cur.fetchall()
+                
+                # Get recipients from groups
+                cur.execute("""
+                    SELECT r.* FROM recipients r
+                    JOIN groups g ON r.group_id = g.group_id
+                    JOIN campaign_groups cg ON g.group_id = cg.group_id
+                    WHERE cg.campaign_id = %s AND cg.is_active = TRUE AND g.is_active = TRUE AND r.is_active = TRUE
+                    AND r.recipient_id NOT IN (
+                        SELECT cr.recipient_id FROM campaign_recipients cr 
+                        WHERE cr.campaign_id = %s AND cr.is_active = TRUE
+                    )
+                """, (campaign_id, campaign_id))
+                group_recipients = cur.fetchall()
+                
+                # Combine both sets of recipients, avoiding duplicates
+                recipients = list(direct_recipients)
+                
+                # Add group recipients that aren't already direct recipients
+                recipient_ids = set(r['recipient_id'] for r in recipients)
+                for recipient in group_recipients:
+                    if recipient['recipient_id'] not in recipient_ids:
+                        recipients.append(recipient)
+                        recipient_ids.add(recipient['recipient_id'])
+                
+                app.logger.info(f"📧 Sending campaign to {len(recipients)} recipients ({len(direct_recipients)} direct, {len(group_recipients)} from groups)")
             
             # Email configuration
             smtp_server = SMTP_SERVER
@@ -797,7 +834,7 @@ def safe_check_for_replies():
 
 # Initialize scheduler for checking replies - runs every 10 minutes
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=safe_check_for_replies, trigger="interval", minutes=20)
+scheduler.add_job(func=safe_check_for_replies, trigger="interval", minutes=1)
 scheduler.start()
 
 # Shut down the scheduler when exiting the app
@@ -1304,6 +1341,8 @@ def get_campaigns():
     
     return jsonify(result), 200
 
+
+#changed now
 @app.route('/api/campaigns', methods=['POST'])
 @jwt_required()
 @handle_transaction
@@ -1351,9 +1390,15 @@ def create_campaign():
             RETURNING template_id
         """, (user_id, campaign_id, template_name, html_content, text_content))
     
-    # Add recipients if provided
-    if 'recipients' in data:
-        for recipient_id in data['recipients']:
+    # Add individual recipients if provided
+    if 'recipients' in data and data['recipients']:
+        for recipient_item in data['recipients']:
+            # Handle if recipient is a dict or a string ID
+            if isinstance(recipient_item, dict) and 'recipient_id' in recipient_item:
+                recipient_id = recipient_item['recipient_id']
+            else:
+                recipient_id = recipient_item
+                
             # Verify recipient belongs to user
             cur.execute("""
                 SELECT recipient_id FROM recipients
@@ -1367,10 +1412,215 @@ def create_campaign():
                     ON CONFLICT (campaign_id, recipient_id) DO NOTHING
                 """, (campaign_id, recipient_id))
     
+    # Add groups if provided
+    if 'groups' in data and data['groups']:
+        for group_item in data['groups']:
+            # Handle if group is a dict or a string ID
+            if isinstance(group_item, dict) and ('id' in group_item or 'group_id' in group_item):
+                group_id = group_item.get('id') or group_item.get('group_id')
+            else:
+                group_id = group_item
+                
+            # Debug logging to identify the issue
+            app.logger.info(f"Processing group: {group_item}, extracted ID: {group_id}")
+            
+            # Verify group belongs to user
+            cur.execute("""
+                SELECT group_id FROM groups
+                WHERE group_id = %s AND user_id = %s
+            """, (group_id, user_id))
+            
+            if cur.fetchone():
+                # Add group to campaign_groups table
+                cur.execute("""
+                    INSERT INTO campaign_groups (campaign_id, group_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (campaign_id, group_id) DO NOTHING
+                """, (campaign_id, group_id))
+    
     return jsonify({
         'message': 'Campaign created successfully',
         'campaign_id': str(campaign_id)
     }), 201
+
+# @app.route('/api/campaigns/<campaign_id>', methods=['GET'])
+# @jwt_required()
+# @handle_transaction
+# def get_campaign(campaign_id):
+#     """Get a single campaign by ID"""
+#     user_id = get_jwt_identity()
+#     conn, cur = get_db_connection()
+    
+#     # Get campaign details
+#     cur.execute("""
+#         SELECT * FROM email_campaigns
+#         WHERE campaign_id = %s AND user_id = %s
+#     """, (campaign_id, user_id))
+    
+#     campaign = cur.fetchone()
+    
+#     if not campaign:
+#         return jsonify({'message': 'Campaign not found'}), 404
+    
+#     # Get template
+#     cur.execute("""
+#         SELECT * FROM email_templates
+#         WHERE campaign_id = %s AND is_active = TRUE
+#         LIMIT 1
+#     """, (campaign_id,))
+#     template = cur.fetchone()
+    
+#     # Get direct recipients
+#     cur.execute("""
+#         SELECT r.* FROM recipients r
+#         JOIN campaign_recipients cr ON r.recipient_id = cr.recipient_id
+#         WHERE cr.campaign_id = %s AND cr.is_active = TRUE AND r.is_active = TRUE
+#     """, (campaign_id,))
+#     recipients = cur.fetchall()
+    
+#     # Get groups for this campaign
+#     cur.execute("""
+#         SELECT g.*, COUNT(r.recipient_id) as recipient_count 
+#         FROM groups g
+#         JOIN campaign_groups cg ON g.group_id = cg.group_id
+#         LEFT JOIN recipients r ON g.group_id = r.group_id AND r.is_active = TRUE
+#         WHERE cg.campaign_id = %s AND cg.is_active = TRUE AND g.is_active = TRUE
+#         GROUP BY g.group_id
+#     """, (campaign_id,))
+#     groups = cur.fetchall()
+    
+#     # Process recipients
+#     recipient_list = []
+#     for recipient in recipients:
+#         recipient_data = dict(recipient)
+#         recipient_data['recipient_id'] = str(recipient_data['recipient_id'])
+#         recipient_data['user_id'] = str(recipient_data['user_id'])
+#         if recipient_data.get('group_id'):
+#             recipient_data['group_id'] = str(recipient_data['group_id'])
+            
+#             # Get group name for this recipient if it has a group
+#             cur.execute("""
+#                 SELECT name FROM groups WHERE group_id = %s
+#             """, (recipient['group_id'],))
+#             group_result = cur.fetchone()
+#             if group_result:
+#                 recipient_data['group_name'] = group_result['name']
+        
+#         recipient_list.append(recipient_data)
+    
+#     # Process groups
+#     group_list = []
+#     for group in groups:
+#         group_data = dict(group)
+#         group_data['group_id'] = str(group_data['group_id']) 
+#         group_data['user_id'] = str(group_data['user_id'])
+#         group_data['id'] = group_data['group_id']  # For frontend compatibility
+        
+#         # Format dates
+#         for key in ['created_at', 'updated_at']:
+#             if key in group_data and group_data[key]:
+#                 group_data[key] = group_data[key].isoformat()
+                
+#         group_list.append(group_data)
+    
+#     # Get tracking stats if campaign sent
+#     tracking_stats = None
+#     if campaign['status'] == 'completed':
+#         cur.execute("""
+#             SELECT 
+#                 COUNT(*) FILTER (WHERE sent_at IS NOT NULL) as sent_count,
+#                 COUNT(*) FILTER (WHERE opened_at IS NOT NULL) as opened_count,
+#                 COUNT(*) FILTER (WHERE clicked_at IS NOT NULL) as clicked_count,
+#                 COUNT(*) FILTER (WHERE replied_at IS NOT NULL) as replied_count
+#             FROM email_tracking
+#             WHERE campaign_id = %s
+#         """, (campaign_id,))
+#         overall_stats = cur.fetchone()
+        
+#         # Get individual recipient tracking
+#         cur.execute("""
+#             SELECT et.*, r.email, r.first_name, r.last_name 
+#             FROM email_tracking et
+#             JOIN recipients r ON et.recipient_id = r.recipient_id
+#             WHERE et.campaign_id = %s
+#         """, (campaign_id,))
+#         recipient_tracking = cur.fetchall()
+        
+#         # Calculate rates
+#         sent_count = overall_stats['sent_count']
+#         opened_count = overall_stats['opened_count']
+#         clicked_count = overall_stats['clicked_count']
+#         replied_count = overall_stats['replied_count']
+        
+#         open_rate = (opened_count / sent_count * 100) if sent_count > 0 else 0
+#         click_rate = (clicked_count / sent_count * 100) if sent_count > 0 else 0
+#         reply_rate = (replied_count / sent_count * 100) if sent_count > 0 else 0
+        
+#         # Format recipient tracking data
+#         recipient_tracking_list = []
+#         for tracking in recipient_tracking:
+#             tracking_data = dict(tracking)
+#             for key in ['tracking_id', 'campaign_id', 'recipient_id']:
+#                 if key in tracking_data and tracking_data[key]:
+#                     tracking_data[key] = str(tracking_data[key])
+            
+#             # Format dates to ISO strings
+#             for key in ['sent_at', 'opened_at', 'clicked_at', 'replied_at', 'created_at', 'updated_at']:
+#                 if key in tracking_data and tracking_data[key]:
+#                     tracking_data[key] = tracking_data[key].isoformat()
+            
+#             recipient_tracking_list.append(tracking_data)
+        
+#         tracking_stats = {
+#             'overall': {
+#                 'sent_count': sent_count,
+#                 'opened_count': opened_count,
+#                 'clicked_count': clicked_count,
+#                 'replied_count': replied_count,
+#                 'open_rate': open_rate,
+#                 'click_rate': click_rate,
+#                 'reply_rate': reply_rate
+#             },
+#             'recipients': recipient_tracking_list
+#         }
+    
+#     # Prepare template data
+#     # Prepare template data
+#     template_data = None
+#     if template:
+#         template_data = dict(template)
+#         template_data['template_id'] = str(template_data['template_id'])
+#         template_data['user_id'] = str(template_data['user_id'])
+#         template_data['campaign_id'] = str(template_data['campaign_id'])
+        
+#         # Format dates
+#         for key in ['created_at', 'updated_at']:
+#             if key in template_data and template_data[key]:
+#                 template_data[key] = template_data[key].isoformat()
+    
+#     # Prepare campaign data
+#     campaign_data = dict(campaign)
+#     campaign_data['campaign_id'] = str(campaign_data['campaign_id'])
+#     campaign_data['user_id'] = str(campaign_data['user_id'])
+    
+#     # Format dates
+#     for key in ['created_at', 'scheduled_at', 'sent_at']:
+#         if key in campaign_data and campaign_data[key]:
+#             campaign_data[key] = campaign_data[key].isoformat()
+    
+#     # Calculate total recipient count including those from groups
+#     total_recipient_count = len(recipient_list)
+#     campaign_data['recipient_count'] = total_recipient_count
+    
+#     result = {
+#         **campaign_data,
+#         'template': template_data,
+#         'recipients': recipient_list,
+#         'groups': group_list,
+#         'tracking_stats': tracking_stats
+#     }
+    
+#     return jsonify(result), 200
 
 @app.route('/api/campaigns/<campaign_id>', methods=['GET'])
 @jwt_required()
@@ -1399,20 +1649,57 @@ def get_campaign(campaign_id):
     """, (campaign_id,))
     template = cur.fetchone()
     
-    # Get recipients
+    # Get direct recipients
     cur.execute("""
-        SELECT r.* FROM recipients r
+        SELECT r.*, g.name as group_name
+        FROM recipients r
         JOIN campaign_recipients cr ON r.recipient_id = cr.recipient_id
+        LEFT JOIN groups g ON r.group_id = g.group_id
         WHERE cr.campaign_id = %s AND cr.is_active = TRUE AND r.is_active = TRUE
     """, (campaign_id,))
     recipients = cur.fetchall()
     
+    # Get groups for this campaign with recipient counts
+    cur.execute("""
+        SELECT g.*, COUNT(r.recipient_id) as recipient_count 
+        FROM groups g
+        JOIN campaign_groups cg ON g.group_id = cg.group_id
+        LEFT JOIN recipients r ON g.group_id = r.group_id AND r.is_active = TRUE
+        WHERE cg.campaign_id = %s AND cg.is_active = TRUE AND g.is_active = TRUE
+        GROUP BY g.group_id
+    """, (campaign_id,))
+    groups = cur.fetchall()
+    
+    # Process recipients
     recipient_list = []
     for recipient in recipients:
         recipient_data = dict(recipient)
         recipient_data['recipient_id'] = str(recipient_data['recipient_id'])
         recipient_data['user_id'] = str(recipient_data['user_id'])
+        if recipient_data.get('group_id'):
+            recipient_data['group_id'] = str(recipient_data['group_id'])
+        
+        # Format dates
+        for key in ['created_at', 'updated_at']:
+            if key in recipient_data and recipient_data[key]:
+                recipient_data[key] = recipient_data[key].isoformat()
+        
         recipient_list.append(recipient_data)
+    
+    # Process groups
+    group_list = []
+    for group in groups:
+        group_data = dict(group)
+        group_data['group_id'] = str(group_data['group_id'])
+        group_data['user_id'] = str(group_data['user_id'])
+        group_data['id'] = group_data['group_id']  # For frontend compatibility
+        
+        # Format dates
+        for key in ['created_at', 'updated_at']:
+            if key in group_data and group_data[key]:
+                group_data[key] = group_data[key].isoformat()
+        
+        group_list.append(group_data)
     
     # Get tracking stats if campaign sent
     tracking_stats = None
@@ -1498,10 +1785,38 @@ def get_campaign(campaign_id):
         if key in campaign_data and campaign_data[key]:
             campaign_data[key] = campaign_data[key].isoformat()
     
+    # Calculate total recipient count
+    # This includes direct recipients and all recipients from the groups
+    cur.execute("""
+        WITH campaign_direct_recipients AS (
+            SELECT COUNT(DISTINCT cr.recipient_id) as count
+            FROM campaign_recipients cr
+            WHERE cr.campaign_id = %s AND cr.is_active = TRUE
+        ),
+        campaign_group_recipients AS (
+            SELECT COUNT(DISTINCT r.recipient_id) as count
+            FROM recipients r
+            JOIN groups g ON r.group_id = g.group_id
+            JOIN campaign_groups cg ON g.group_id = cg.group_id
+            WHERE cg.campaign_id = %s AND cg.is_active = TRUE AND g.is_active = TRUE AND r.is_active = TRUE
+            AND r.recipient_id NOT IN (
+                SELECT cr.recipient_id FROM campaign_recipients cr 
+                WHERE cr.campaign_id = %s AND cr.is_active = TRUE
+            )
+        )
+        SELECT
+            (SELECT count FROM campaign_direct_recipients) +
+            (SELECT count FROM campaign_group_recipients) as total_count
+    """, (campaign_id, campaign_id, campaign_id))
+    
+    total_count_result = cur.fetchone()
+    campaign_data['recipient_count'] = total_count_result['total_count'] if total_count_result else len(recipient_list)
+    
     result = {
         **campaign_data,
         'template': template_data,
         'recipients': recipient_list,
+        'groups': group_list,
         'tracking_stats': tracking_stats
     }
     
@@ -2236,7 +2551,7 @@ def track_beacon(tracking_pixel_id):
 # Manual Reply Marking Endpoint
 @app.route('/api/campaigns/<campaign_id>/mark-replied', methods=['POST'])
 @jwt_required()
-def mark_email_replied(campaign_id):
+def mark_email_repliedd(campaign_id):
     """Manually mark an email as replied"""
     user_id = get_jwt_identity()
     data = request.get_json()
@@ -2708,6 +3023,357 @@ def test_click(tracking_id):
         if conn:
             conn.rollback()
         return jsonify({'error': str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+@app.route('/api/campaigns/<campaign_id>/groups', methods=['GET'])
+@jwt_required()
+@handle_transaction
+def get_campaign_groups(campaign_id):
+    """Get all groups associated with a campaign"""
+    user_id = get_jwt_identity()
+    conn, cur = get_db_connection()
+    
+    # Verify campaign belongs to user
+    cur.execute("""
+        SELECT * FROM email_campaigns
+        WHERE campaign_id = %s AND user_id = %s
+    """, (campaign_id, user_id))
+    
+    if not cur.fetchone():
+        return jsonify({'message': 'Campaign not found or access denied'}), 404
+    
+    # Get groups for this campaign with recipient counts
+    cur.execute("""
+        SELECT g.*, COUNT(r.recipient_id) as recipient_count 
+        FROM groups g
+        JOIN campaign_groups cg ON g.group_id = cg.group_id
+        LEFT JOIN recipients r ON g.group_id = r.group_id AND r.is_active = TRUE
+        WHERE cg.campaign_id = %s AND cg.is_active = TRUE AND g.is_active = TRUE
+        GROUP BY g.group_id
+    """, (campaign_id,))
+    
+    groups = cur.fetchall()
+    
+    result = []
+    for group in groups:
+        group_data = dict(group)
+        group_data['group_id'] = str(group_data['group_id'])
+        group_data['user_id'] = str(group_data['user_id'])
+        group_data['id'] = group_data['group_id']  # For frontend compatibility
+        
+        # Format dates
+        for key in ['created_at', 'updated_at']:
+            if key in group_data and group_data[key]:
+                group_data[key] = group_data[key].isoformat()
+        
+        result.append(group_data)
+    
+    return jsonify(result), 200
+
+@app.route('/api/campaigns/<campaign_id>/groups', methods=['POST'])
+@jwt_required()
+@handle_transaction
+def add_groups_to_campaign(campaign_id):
+    """Add groups to a campaign"""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    # Validate data
+    if not data or 'group_ids' not in data or not data['group_ids']:
+        return jsonify({'message': 'No group IDs provided'}), 400
+    
+    conn, cur = get_db_connection()
+    
+    # Verify campaign belongs to user
+    cur.execute("""
+        SELECT * FROM email_campaigns
+        WHERE campaign_id = %s AND user_id = %s
+    """, (campaign_id, user_id))
+    
+    if not cur.fetchone():
+        return jsonify({'message': 'Campaign not found or access denied'}), 404
+    
+    # Convert group_ids to a list if it's a single value
+    group_ids = data['group_ids']
+    if not isinstance(group_ids, list):
+        group_ids = [group_ids]
+    
+    # Add groups to campaign
+    added_count = 0
+    for group_id in group_ids:
+        # Verify group belongs to user
+        cur.execute("""
+            SELECT group_id FROM groups
+            WHERE group_id = %s AND user_id = %s AND is_active = TRUE
+        """, (group_id, user_id))
+        
+        if cur.fetchone():
+            cur.execute("""
+                INSERT INTO campaign_groups (campaign_id, group_id)
+                VALUES (%s, %s)
+                ON CONFLICT (campaign_id, group_id) DO NOTHING
+            """, (campaign_id, group_id))
+            added_count += 1
+    
+    return jsonify({
+        'message': f'Added {added_count} groups to campaign',
+        'added_count': added_count
+    }), 200
+
+@app.route('/api/campaigns/<campaign_id>/groups/remove', methods=['POST'])
+@jwt_required()
+@handle_transaction
+def remove_groups_from_campaign(campaign_id):
+    """Remove groups from a campaign"""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    # Validate data
+    if not data or 'group_ids' not in data or not data['group_ids']:
+        return jsonify({'message': 'No group IDs provided'}), 400
+    
+    conn, cur = get_db_connection()
+    
+    # Verify campaign belongs to user
+    cur.execute("""
+        SELECT * FROM email_campaigns
+        WHERE campaign_id = %s AND user_id = %s
+    """, (campaign_id, user_id))
+    
+    if not cur.fetchone():
+        return jsonify({'message': 'Campaign not found or access denied'}), 404
+    
+    # Convert group_ids to a list if it's a single value
+    group_ids = data['group_ids']
+    if not isinstance(group_ids, list):
+        group_ids = [group_ids]
+    
+    # Remove groups from campaign
+    placeholders = ','.join(['%s'] * len(group_ids))
+    query_params = group_ids + [campaign_id]
+    
+    cur.execute(f"""
+        UPDATE campaign_groups
+        SET is_active = FALSE
+        WHERE group_id IN ({placeholders}) AND campaign_id = %s
+    """, query_params)
+    
+    return jsonify({
+        'message': f'Removed groups from campaign',
+        'removed_count': len(group_ids)
+    }), 200
+
+@app.route('/api/campaigns/<campaign_id>/update', methods=['POST'])
+@jwt_required()
+@handle_transaction
+def update_campaign(campaign_id):
+    """Update an existing campaign"""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    conn, cur = get_db_connection()
+    
+    # Verify campaign exists and belongs to user
+    cur.execute("""
+        SELECT * FROM email_campaigns
+        WHERE campaign_id = %s AND user_id = %s
+    """, (campaign_id, user_id))
+    
+    campaign = cur.fetchone()
+    
+    if not campaign:
+        return jsonify({'message': 'Campaign not found or access denied'}), 404
+    
+    # Only allow updating campaigns in draft status
+    if campaign['status'] != 'draft':
+        return jsonify({'message': f'Cannot update campaign in {campaign["status"]} status'}), 400
+    
+    # Update campaign fields
+    update_fields = []
+    update_values = []
+    
+    if 'campaign_name' in data and data['campaign_name']:
+        update_fields.append("campaign_name = %s")
+        update_values.append(data['campaign_name'])
+    
+    if 'subject_line' in data and data['subject_line']:
+        update_fields.append("subject_line = %s")
+        update_values.append(data['subject_line'])
+    
+    if 'from_name' in data and data['from_name']:
+        update_fields.append("from_name = %s")
+        update_values.append(data['from_name'])
+    
+    if 'from_email' in data and data['from_email']:
+        update_fields.append("from_email = %s")
+        update_values.append(data['from_email'])
+    
+    if 'reply_to_email' in data and data['reply_to_email']:
+        update_fields.append("reply_to_email = %s")
+        update_values.append(data['reply_to_email'])
+    
+    if update_fields:
+        update_fields.append("updated_at = NOW()")
+        update_query = f"""
+            UPDATE email_campaigns
+            SET {', '.join(update_fields)}
+            WHERE campaign_id = %s
+        """
+        update_values.append(campaign_id)
+        
+        cur.execute(update_query, update_values)
+    
+    # Update template if provided
+    if 'template' in data:
+        template_name = data['template'].get('name', 'Default Template')
+        html_content = data['template']['html_content']
+        text_content = data['template'].get('text_content', '')
+        
+        # Check if template exists
+        cur.execute("""
+            SELECT * FROM email_templates
+            WHERE campaign_id = %s AND is_active = TRUE
+        """, (campaign_id,))
+        
+        template = cur.fetchone()
+        
+        if template:
+            # Update existing template
+            cur.execute("""
+                UPDATE email_templates
+                SET 
+                    template_name = %s,
+                    html_content = %s,
+                    text_content = %s,
+                    updated_at = NOW()
+                WHERE template_id = %s
+            """, (template_name, html_content, text_content, template['template_id']))
+        else:
+            # Create new template
+            cur.execute("""
+                INSERT INTO email_templates
+                (user_id, campaign_id, template_name, html_content, text_content)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (user_id, campaign_id, template_name, html_content, text_content))
+    
+    # Update recipients if provided
+    if 'recipients' in data:
+        # First remove all existing recipients
+        cur.execute("""
+            UPDATE campaign_recipients
+            SET is_active = FALSE
+            WHERE campaign_id = %s
+        """, (campaign_id,))
+        
+        # Then add the new recipients
+        for recipient_id in data['recipients']:
+            # Verify recipient belongs to user
+            cur.execute("""
+                SELECT recipient_id FROM recipients
+                WHERE recipient_id = %s AND user_id = %s
+            """, (recipient_id, user_id))
+            
+            if cur.fetchone():
+                cur.execute("""
+                    INSERT INTO campaign_recipients (campaign_id, recipient_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (campaign_id, recipient_id) DO UPDATE
+                    SET is_active = TRUE
+                """, (campaign_id, recipient_id))
+    
+    # Update groups if provided
+    if 'groups' in data:
+        # First remove all existing groups
+        cur.execute("""
+            UPDATE campaign_groups
+            SET is_active = FALSE
+            WHERE campaign_id = %s
+        """, (campaign_id,))
+        
+        # Then add the new groups
+        for group_id in data['groups']:
+            # Verify group belongs to user
+            cur.execute("""
+                SELECT group_id FROM groups
+                WHERE group_id = %s AND user_id = %s
+            """, (group_id, user_id))
+            
+            if cur.fetchone():
+                cur.execute("""
+                    INSERT INTO campaign_groups (campaign_id, group_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (campaign_id, group_id) DO UPDATE
+                    SET is_active = TRUE
+                """, (campaign_id, group_id))
+    
+    return jsonify({
+        'message': 'Campaign updated successfully',
+        'campaign_id': str(campaign_id)
+    }), 200
+
+@app.route('/api/campaigns/<campaign_id>/recipients/<recipient_id>/replied', methods=['POST'])
+@jwt_required()
+def mark_email_replied(campaign_id, recipient_id):
+    """Manually mark an email as replied"""
+    user_id = get_jwt_identity()
+    conn = None
+    
+    try:
+        app.logger.info(f"Attempting to mark recipient {recipient_id} as replied for campaign {campaign_id}")
+        
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS
+        )
+        conn.autocommit = False
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Verify campaign belongs to user
+        cur.execute("""
+            SELECT * FROM email_campaigns
+            WHERE campaign_id = %s AND user_id = %s
+        """, (campaign_id, user_id))
+        
+        if not cur.fetchone():
+            return jsonify({'message': 'Campaign not found or access denied'}), 404
+        
+        # Update tracking record
+        cur.execute("""
+            UPDATE email_tracking
+            SET 
+                email_status = 'replied',
+                replied_at = COALESCE(replied_at, NOW()),
+                updated_at = NOW()
+            WHERE campaign_id = %s AND recipient_id = %s
+            RETURNING tracking_id, replied_at
+        """, (campaign_id, recipient_id))
+        
+        result = cur.fetchone()
+        
+        if not result:
+            app.logger.warning(f"No tracking record found for recipient {recipient_id} in campaign {campaign_id}")
+            return jsonify({'message': 'No tracking record found for this recipient'}), 404
+        
+        # Explicitly commit the transaction
+        conn.commit()
+        
+        app.logger.info(f"Successfully marked recipient {recipient_id} as replied for campaign {campaign_id}")
+        
+        return jsonify({
+            'message': 'Email marked as replied successfully',
+            'tracking_id': str(result['tracking_id']),
+            'replied_at': result['replied_at'].isoformat()
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error marking email as replied: {str(e)}")
+        if conn:
+            conn.rollback()
+        return jsonify({'message': f'Error: {str(e)}'}), 500
     finally:
         if conn:
             conn.close()
