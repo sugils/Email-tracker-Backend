@@ -441,7 +441,7 @@ def rewrite_links(html_content, tracking_id, base_url):
             conn.close()
 
 # Email Sending Functions
-def send_email_async(campaign_id, test_mode=False, base_url=None):
+# def send_email_async(campaign_id, test_mode=False, base_url=None):
     """Asynchronously send emails for a campaign"""
     # Create a new app context for the thread
     with app.app_context():
@@ -659,6 +659,342 @@ def send_email_async(campaign_id, test_mode=False, base_url=None):
         finally:
             if conn:
                 conn.close()
+# Find this function in app.py and replace it with this updated version
+def send_email_async(campaign_id, test_mode=False, base_url=None):
+    """Asynchronously send emails for a campaign with improved tracking"""
+    # Create a new app context for the thread
+    with app.app_context():
+        # Use a direct connection instead of Flask's g since this runs in a background thread
+        conn = None
+        try:
+            # Get public URL for tracking
+            if not base_url:
+                base_url = os.environ.get('BASE_URL', 'http://localhost:5000/')
+                if not base_url.endswith('/'):
+                    base_url += '/'
+            
+            app.logger.info(f"📧 Starting email sending for campaign {campaign_id}, test_mode={test_mode}, base_url={base_url}")
+            
+            conn = psycopg2.connect(
+                host=DB_HOST,
+                database=DB_NAME,
+                user=DB_USER,
+                password=DB_PASS
+            )
+            conn.autocommit = False
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Get campaign details
+            cur.execute("""
+                SELECT * FROM email_campaigns WHERE campaign_id = %s
+            """, (campaign_id,))
+            campaign = cur.fetchone()
+            
+            if not campaign:
+                app.logger.error(f"❌ Campaign {campaign_id} not found")
+                return
+            
+            # Get template for campaign
+            cur.execute("""
+                SELECT * FROM email_templates 
+                WHERE campaign_id = %s AND is_active = TRUE
+                LIMIT 1
+            """, (campaign_id,))
+            template = cur.fetchone()
+            
+            if not template:
+                app.logger.error(f"❌ No active template found for campaign {campaign_id}")
+                return
+            
+            if test_mode:
+                # Send only to the campaign owner for testing
+                cur.execute("""
+                    SELECT * FROM users WHERE user_id = %s
+                """, (campaign['user_id'],))
+                user = cur.fetchone()
+                recipients = [{'email': user['email'], 'recipient_id': None}]
+                app.logger.info(f"📧 Test mode: Sending to campaign owner {user['email']}")
+            else:
+                # Get all direct recipients for this campaign
+                cur.execute("""
+                    SELECT r.* FROM recipients r
+                    JOIN campaign_recipients cr ON r.recipient_id = cr.recipient_id
+                    WHERE cr.campaign_id = %s AND cr.is_active = TRUE AND r.is_active = TRUE
+                """, (campaign_id,))
+                direct_recipients = cur.fetchall()
+                
+                # Get recipients from groups
+                cur.execute("""
+                    SELECT r.* FROM recipients r
+                    JOIN groups g ON r.group_id = g.group_id
+                    JOIN campaign_groups cg ON g.group_id = cg.group_id
+                    WHERE cg.campaign_id = %s AND cg.is_active = TRUE AND g.is_active = TRUE AND r.is_active = TRUE
+                    AND r.recipient_id NOT IN (
+                        SELECT cr.recipient_id FROM campaign_recipients cr 
+                        WHERE cr.campaign_id = %s AND cr.is_active = TRUE
+                    )
+                """, (campaign_id, campaign_id))
+                group_recipients = cur.fetchall()
+                
+                # Combine both sets of recipients, avoiding duplicates
+                recipients = list(direct_recipients)
+                
+                # Add group recipients that aren't already direct recipients
+                recipient_ids = set(r['recipient_id'] for r in recipients)
+                for recipient in group_recipients:
+                    if recipient['recipient_id'] not in recipient_ids:
+                        recipients.append(recipient)
+                        recipient_ids.add(recipient['recipient_id'])
+                
+                app.logger.info(f"📧 Sending campaign to {len(recipients)} recipients ({len(direct_recipients)} direct, {len(group_recipients)} from groups)")
+            
+            # Email configuration
+            smtp_server = SMTP_SERVER
+            smtp_port = SMTP_PORT
+            smtp_username = SMTP_USERNAME
+            smtp_password = SMTP_PASSWORD
+            
+            # Initialize SMTP server connection
+            app.logger.info(f"🔌 Connecting to SMTP server {smtp_server}:{smtp_port}")
+            server = smtplib.SMTP(smtp_server, smtp_port)
+            server.ehlo()
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            app.logger.info("✅ SMTP connection established")
+            
+            # Track send counts
+            success_count = 0
+            failure_count = 0
+            
+            # Import our helper function (will be defined above)
+            from bs4 import BeautifulSoup
+            
+            for recipient in recipients:
+                try:
+                    # Create unique tracking pixel for this email
+                    tracking_pixel_id = str(uuid.uuid4())
+                    app.logger.debug(f"🔍 Created tracking pixel ID: {tracking_pixel_id} for {recipient['email']}")
+                    
+                    # Create tracking entry
+                    if not test_mode:
+                        cur.execute("""
+                            INSERT INTO email_tracking 
+                            (campaign_id, recipient_id, tracking_pixel_id, email_status)
+                            VALUES (%s, %s, %s, 'sending')
+                            RETURNING tracking_id
+                        """, (campaign_id, recipient['recipient_id'], tracking_pixel_id))
+                        tracking = cur.fetchone()
+                        conn.commit()
+                        app.logger.debug(f"✅ Created tracking entry: {tracking['tracking_id']}")
+                    else:
+                        # For test mode, create a temporary tracking ID
+                        tracking = {'tracking_id': str(uuid.uuid4())}
+                    
+                    # Personalize email content
+                    html_content = template['html_content']
+                    text_content = template.get('text_content', '')
+                    
+                    if not test_mode and recipient.get('first_name'):
+                        html_content = html_content.replace('{{first_name}}', recipient['first_name'])
+                        text_content = text_content.replace('{{first_name}}', recipient['first_name'])
+                        if recipient.get('last_name'):
+                            html_content = html_content.replace('{{last_name}}', recipient['last_name'])
+                            text_content = text_content.replace('{{last_name}}', recipient['last_name'])
+                    
+                    # First rewrite links for click tracking
+                    if not test_mode:
+                        html_content = rewrite_links(html_content, tracking['tracking_id'], base_url)
+                    
+                    # Add multiple tracking mechanisms using our new function
+                    # The function adds tracking pixels throughout the email for redundancy
+                    html_content = add_tracking_elements(html_content, tracking_pixel_id, tracking['tracking_id'], base_url)
+                    
+                    # Create email message
+                    msg = MIMEMultipart('alternative')
+                    msg['Subject'] = campaign['subject_line']
+                    msg['From'] = f"{campaign['from_name']} <{campaign['from_email']}>"
+                    msg['To'] = recipient['email']
+                    msg['Reply-To'] = campaign['reply_to_email']
+                    # Add important headers for better deliverability
+                    msg['List-Unsubscribe'] = f"<mailto:{campaign['reply_to_email']}?subject=Unsubscribe>"
+                    
+                    # Add text and HTML parts
+                    if text_content:
+                        part1 = MIMEText(text_content, 'plain')
+                        msg.attach(part1)
+                    
+                    part2 = MIMEText(html_content, 'html')
+                    msg.attach(part2)
+                    
+                    # Send the email
+                    server.send_message(msg)
+                    success_count += 1
+                    
+                    # Log that message was sent
+                    app.logger.info(f"✅ Email sent to {recipient['email']}")
+                    
+                    # Update tracking status
+                    if not test_mode:
+                        cur.execute("""
+                            UPDATE email_tracking
+                            SET email_status = 'sent', sent_at = NOW(), updated_at = NOW()
+                            WHERE tracking_id = %s
+                        """, (tracking['tracking_id'],))
+                        conn.commit()
+                
+                except Exception as e:
+                    app.logger.error(f"❌ Error sending email to {recipient['email']}: {str(e)}")
+                    failure_count += 1
+                    if not test_mode:
+                        try:
+                            cur.execute("""
+                                UPDATE email_tracking
+                                SET email_status = 'failed', updated_at = NOW()
+                                WHERE tracking_id = %s
+                            """, (tracking['tracking_id'],))
+                            conn.commit()
+                        except Exception as ex:
+                            app.logger.error(f"❌ Error updating tracking status: {str(ex)}")
+                            conn.rollback()
+            
+            # Close the SMTP connection
+            server.quit()
+            app.logger.info(f"✅ SMTP connection closed, sent {success_count} emails, {failure_count} failures")
+            
+            # Update campaign status
+            if not test_mode:
+                cur.execute("""
+                    UPDATE email_campaigns
+                    SET status = 'completed', sent_at = NOW()
+                    WHERE campaign_id = %s
+                """, (campaign_id,))
+                conn.commit()
+                app.logger.info(f"✅ Campaign {campaign_id} marked as completed")
+                
+        except Exception as e:
+            app.logger.error(f"❌ Error in send_email_async: {str(e)}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+
+
+#Open Tracking function code 
+def add_tracking_elements(html_content, tracking_pixel_id, tracking_id, base_url):
+    """
+    Properly add tracking pixel and beacon to HTML email content
+    to reliably track opens even without clicks.
+    
+    Parameters:
+    - html_content: The original HTML content
+    - tracking_pixel_id: Unique ID for the tracking pixel
+    - tracking_id: ID of the tracking entry in the database
+    - base_url: Base URL for the application
+    
+    Returns:
+    - Modified HTML content with tracking elements
+    """
+    from bs4 import BeautifulSoup
+    import logging
+    
+    # Parse HTML content
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Create tracking pixel
+    tracking_pixel_url = f"{base_url}track/open/{tracking_pixel_id}"
+    tracking_pixel = soup.new_tag('img', 
+                                 src=tracking_pixel_url,
+                                 width="1", 
+                                 height="1", 
+                                 alt="",
+                                 style="display:none")
+    
+    # Create JavaScript beacon as backup
+    js_beacon = soup.new_tag('script')
+    js_beacon.string = f"""
+        (function() {{
+            try {{
+                // Try to send tracking beacon immediately
+                var img = new Image();
+                img.src = '{base_url}track/beacon/{tracking_pixel_id}?t=' + new Date().getTime();
+                
+                // Also try again after a delay to catch delayed loads
+                setTimeout(function() {{
+                    var img2 = new Image();
+                    img2.src = '{base_url}track/beacon/{tracking_pixel_id}?t=' + new Date().getTime() + '&d=1';
+                }}, 2000);
+            }} catch(e) {{
+                // Silently fail if JS is blocked
+            }}
+        }})();
+    """
+    
+    # Create multiple tracking mechanisms for redundancy
+    
+    # 1. Add to body in multiple locations if it exists
+    if soup.body:
+        try:
+            # Add at beginning of body in a hidden div
+            hidden_div = soup.new_tag('div', style="display:none !important; max-height:0px; overflow:hidden;")
+            hidden_div.append(tracking_pixel.copy())
+            soup.body.insert(0, hidden_div)
+            
+            # Add in the middle of content for better chance of loading
+            if len(soup.body.contents) > 2:
+                middle_index = len(soup.body.contents) // 2
+                middle_div = soup.new_tag('div', style="display:none !important;")
+                middle_div.append(tracking_pixel.copy())
+                soup.body.insert(middle_index, middle_div)
+                
+            # Add at end of body
+            soup.body.append(tracking_pixel.copy())
+            soup.body.append(js_beacon)
+        except Exception as e:
+            logging.error(f"Error adding tracking to body: {str(e)}")
+    
+    # 2. Add to HTML head if it exists
+    if soup.head:
+        try:
+            # Add a prefetch link to trigger loading
+            prefetch = soup.new_tag('link', 
+                                   rel="prefetch", 
+                                   href=tracking_pixel_url)
+            soup.head.append(prefetch)
+            
+            # Add a style with background image for tracking
+            style_tag = soup.new_tag('style')
+            style_tag.string = f"""
+                body::before {{
+                    content: '';
+                    background-image: url('{tracking_pixel_url}?s=css');
+                    display: none;
+                }}
+            """
+            soup.head.append(style_tag)
+        except Exception as e:
+            logging.error(f"Error adding tracking to head: {str(e)}")
+    
+    # 3. If no body or head, add to the root
+    if not soup.body and not soup.head:
+        try:
+            if len(soup.contents) > 0:
+                soup.contents[-1].append(tracking_pixel.copy())
+            else:
+                soup.append(tracking_pixel.copy())
+        except Exception as e:
+            logging.error(f"Error adding tracking to root: {str(e)}")
+    
+    # 4. Also add tracking pixel at the very end of the HTML outside any tags
+    # This ensures it's included even if email clients restructure the HTML
+    html_with_tracking = str(soup)
+    
+    # Add an extra tracking pixel at the very end as a last resort
+    html_with_tracking += f'<!--[if !mso]><!-- --><div style="display:none;max-height:0px;overflow:hidden;"><img src="{tracking_pixel_url}?pos=end" width="1" height="1" alt="" style="display:none" /></div><!--<![endif]-->'
+    
+    return html_with_tracking
+
+
 
 # Email Reply Checking Function
 def check_for_replies():
@@ -2279,12 +2615,103 @@ def get_templates():
     return jsonify(result), 200
 
 # Tracking routes with enhanced logging and direct database connections
+# @app.route('/track/open/<tracking_pixel_id>', methods=['GET'])
+# def track_open(tracking_pixel_id):
+#     """Track email opens via tracking pixel"""
+#     conn = None
+#     try:
+#         app.logger.info(f"🔍 Tracking pixel accessed: {tracking_pixel_id}")
+        
+#         conn = psycopg2.connect(
+#             host=DB_HOST,
+#             database=DB_NAME,
+#             user=DB_USER,
+#             password=DB_PASS
+#         )
+#         conn.autocommit = False
+#         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+#         # Find tracking entry
+#         cur.execute("""
+#             SELECT tracking_id, email_status, opened_at, open_count 
+#             FROM email_tracking
+#             WHERE tracking_pixel_id = %s
+#         """, (tracking_pixel_id,))
+        
+#         tracking = cur.fetchone()
+        
+#         if tracking:
+#             app.logger.info(f"✅ Found tracking entry: {tracking['tracking_id']}")
+#             app.logger.info(f"Current values: status={tracking['email_status']}, opened_at={tracking['opened_at']}, count={tracking['open_count']}")
+            
+#             # Update tracking data - don't downgrade from 'clicked' to 'opened'
+#             cur.execute("""
+#                 UPDATE email_tracking
+#                 SET 
+#                     email_status = CASE
+#                         WHEN email_status IN ('sending', 'sent', 'pending') THEN 'opened'
+#                         ELSE email_status -- Keep existing status if it's 'clicked' or 'replied'
+#                     END,
+#                     opened_at = COALESCE(opened_at, NOW()),
+#                     open_count = open_count + 1,
+#                     updated_at = NOW()
+#                 WHERE tracking_id = %s
+#                 RETURNING tracking_id, email_status, opened_at, open_count, updated_at
+#             """, (tracking['tracking_id'],))
+            
+#             updated = cur.fetchone()
+            
+#             # Explicitly commit and confirm
+#             conn.commit()
+#             app.logger.info(f"✅ UPDATE COMMITTED: status={updated['email_status']}, opened_at={updated['opened_at']}, count={updated['open_count']}")
+            
+#             # Double-check the update
+#             cur.execute("""
+#                 SELECT tracking_id, email_status, opened_at, open_count 
+#                 FROM email_tracking
+#                 WHERE tracking_id = %s
+#             """, (tracking['tracking_id'],))
+            
+#             verification = cur.fetchone()
+#             app.logger.info(f"✅ VERIFIED VALUES: status={verification['email_status']}, opened_at={verification['opened_at']}, count={verification['open_count']}")
+            
+#         else:
+#             app.logger.warning(f"⚠️ No tracking entry found for pixel ID: {tracking_pixel_id}")
+        
+#         # Return a 1x1 transparent pixel
+#         pixel = base64.b64decode('R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==')
+        
+#         return pixel, 200, {
+#             'Content-Type': 'image/gif', 
+#             'Cache-Control': 'no-cache, no-store, must-revalidate, private',
+#             'Pragma': 'no-cache',
+#             'Expires': '0'
+#         }
+    
+#     except Exception as e:
+#         app.logger.error(f"❌ Error tracking open: {str(e)}")
+#         if conn:
+#             try:
+#                 conn.rollback()
+#             except:
+#                 pass
+#         pixel = base64.b64decode('R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==')
+#         return pixel, 200, {'Content-Type': 'image/gif'}
+#     finally:
+#         if conn:
+#             conn.close()
+
 @app.route('/track/open/<tracking_pixel_id>', methods=['GET'])
 def track_open(tracking_pixel_id):
-    """Track email opens via tracking pixel"""
+    """Track email opens via tracking pixel with enhanced reliability"""
     conn = None
     try:
-        app.logger.info(f"🔍 Tracking pixel accessed: {tracking_pixel_id}")
+        # Extract source info if available (for debugging)
+        source = request.args.get('s', 'img')
+        position = request.args.get('pos', 'unknown')
+        user_agent = request.headers.get('User-Agent', 'Unknown')
+        
+        app.logger.info(f"🔍 Tracking pixel accessed: {tracking_pixel_id} (source: {source}, pos: {position}, UA: {user_agent})")
         
         conn = psycopg2.connect(
             host=DB_HOST,
@@ -2297,7 +2724,7 @@ def track_open(tracking_pixel_id):
         
         # Find tracking entry
         cur.execute("""
-            SELECT tracking_id, email_status, opened_at, open_count 
+            SELECT tracking_id, campaign_id, recipient_id, email_status, opened_at, open_count 
             FROM email_tracking
             WHERE tracking_pixel_id = %s
         """, (tracking_pixel_id,))
@@ -2305,15 +2732,15 @@ def track_open(tracking_pixel_id):
         tracking = cur.fetchone()
         
         if tracking:
-            app.logger.info(f"✅ Found tracking entry: {tracking['tracking_id']}")
-            app.logger.info(f"Current values: status={tracking['email_status']}, opened_at={tracking['opened_at']}, count={tracking['open_count']}")
+            app.logger.info(f"✅ Found tracking entry: {tracking['tracking_id']} for campaign {tracking['campaign_id']}")
+            app.logger.debug(f"Current values: status={tracking['email_status']}, opened_at={tracking['opened_at']}, count={tracking['open_count']}")
             
-            # Update tracking data - don't downgrade from 'clicked' to 'opened'
+            # Update tracking data - don't downgrade from 'clicked' or 'replied' to 'opened'
             cur.execute("""
                 UPDATE email_tracking
                 SET 
                     email_status = CASE
-                        WHEN email_status IN ('sending', 'sent', 'pending') THEN 'opened'
+                        WHEN email_status IN ('sending', 'sent', 'pending', 'failed') THEN 'opened'
                         ELSE email_status -- Keep existing status if it's 'clicked' or 'replied'
                     END,
                     opened_at = COALESCE(opened_at, NOW()),
@@ -2329,7 +2756,7 @@ def track_open(tracking_pixel_id):
             conn.commit()
             app.logger.info(f"✅ UPDATE COMMITTED: status={updated['email_status']}, opened_at={updated['opened_at']}, count={updated['open_count']}")
             
-            # Double-check the update
+            # Double-check the update (extra validation)
             cur.execute("""
                 SELECT tracking_id, email_status, opened_at, open_count 
                 FROM email_tracking
@@ -2337,7 +2764,7 @@ def track_open(tracking_pixel_id):
             """, (tracking['tracking_id'],))
             
             verification = cur.fetchone()
-            app.logger.info(f"✅ VERIFIED VALUES: status={verification['email_status']}, opened_at={verification['opened_at']}, count={verification['open_count']}")
+            app.logger.debug(f"✅ VERIFIED VALUES: status={verification['email_status']}, opened_at={verification['opened_at']}, count={verification['open_count']}")
             
         else:
             app.logger.warning(f"⚠️ No tracking entry found for pixel ID: {tracking_pixel_id}")
@@ -2349,7 +2776,8 @@ def track_open(tracking_pixel_id):
             'Content-Type': 'image/gif', 
             'Cache-Control': 'no-cache, no-store, must-revalidate, private',
             'Pragma': 'no-cache',
-            'Expires': '0'
+            'Expires': '0',
+            'Access-Control-Allow-Origin': '*'
         }
     
     except Exception as e:
@@ -2359,11 +2787,13 @@ def track_open(tracking_pixel_id):
                 conn.rollback()
             except:
                 pass
+        # Still return a pixel to avoid broken images
         pixel = base64.b64decode('R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==')
         return pixel, 200, {'Content-Type': 'image/gif'}
     finally:
         if conn:
             conn.close()
+
 
 @app.route('/track/click/<tracking_id>/<url_tracking_id>', methods=['GET'])
 def track_click(tracking_id, url_tracking_id):
@@ -2487,7 +2917,11 @@ def track_beacon(tracking_pixel_id):
     """JavaScript-based tracking endpoint as backup for image tracking"""
     conn = None
     try:
-        app.logger.info(f"🔍 Beacon tracking accessed: {tracking_pixel_id}")
+        # Get delay flag if this is a delayed beacon
+        delayed = request.args.get('d', '0') == '1'
+        user_agent = request.headers.get('User-Agent', 'Unknown')
+        
+        app.logger.info(f"🔍 Beacon tracking accessed: {tracking_pixel_id} (delayed: {delayed}, UA: {user_agent})")
         
         conn = psycopg2.connect(
             host=DB_HOST,
@@ -2500,7 +2934,7 @@ def track_beacon(tracking_pixel_id):
         
         # Find tracking entry
         cur.execute("""
-            SELECT tracking_id, email_status, opened_at, open_count 
+            SELECT tracking_id, campaign_id, recipient_id, email_status, opened_at, open_count 
             FROM email_tracking
             WHERE tracking_pixel_id = %s
         """, (tracking_pixel_id,))
@@ -2508,14 +2942,14 @@ def track_beacon(tracking_pixel_id):
         tracking = cur.fetchone()
         
         if tracking:
-            app.logger.info(f"✅ Found tracking entry for beacon: {tracking['tracking_id']}")
+            app.logger.info(f"✅ Found tracking entry for beacon: {tracking['tracking_id']} (campaign: {tracking['campaign_id']})")
             
             # Update tracking data - similar to track_open
             cur.execute("""
                 UPDATE email_tracking
                 SET 
                     email_status = CASE
-                        WHEN email_status IN ('sending', 'sent', 'pending') THEN 'opened'
+                        WHEN email_status IN ('sending', 'sent', 'pending', 'failed') THEN 'opened'
                         ELSE email_status
                     END,
                     opened_at = COALESCE(opened_at, NOW()),
@@ -2531,9 +2965,11 @@ def track_beacon(tracking_pixel_id):
         else:
             app.logger.warning(f"⚠️ No tracking entry found for beacon ID: {tracking_pixel_id}")
         
+        # Return minimal response with CORS headers to work in any email client
         return jsonify({'status': 'ok'}), 200, {
             'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Access-Control-Allow-Origin': '*'
+            'Access-Control-Allow-Origin': '*',
+            'Content-Type': 'application/json'
         }
     
     except Exception as e:
@@ -2547,7 +2983,7 @@ def track_beacon(tracking_pixel_id):
     finally:
         if conn:
             conn.close()
-
+            
 # Manual Reply Marking Endpoint
 @app.route('/api/campaigns/<campaign_id>/mark-replied', methods=['POST'])
 @jwt_required()
